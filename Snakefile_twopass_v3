@@ -1,0 +1,167 @@
+# Snakemake Snakefile for downloading and aligning FASTQ files corresponding to
+#   ribo-depleted samples to be downsampled. Note that this pipeline is
+#   currently only suitable for paired-end reads.
+#
+# This pipeline downloads and concatenates files from the NCBI GEO database.
+#   Data from other sources can be used. These data should be saved as
+#   zipped fastq files, with suffixes '_1' and '_2' for the two members of
+#   each paired read, in a folder named 'fastqs'.
+#
+# For clarity, it is recommended that the user revise the code below to 
+#   match the name of the reference genome and annotation file they prefer.
+#
+# Uses STAR for alignment. Makes two passes, the first using the splice 
+#   junctions as given in a reference annotation file, and the second 
+#   identifying possible splice junctions not included in that reference file.
+#
+# Requires: 
+# 1) 'all_samples.csv': a csv file in the same directory as this Snakefile, 
+#   with the following columns:
+#     'GSM': GEO accession number from the NCBI Gene Expression Omnibus 
+#       database
+#     'SRA': corresponding run identifiers
+# 2) 'config.yaml': text file in the same directory as this Snakefile, with the
+#   following entries:
+#     'ncbi_prefix': prefix of NCBI GEO database for retrieving runs via wget
+#     'annotation_URL': URL for reference annotation file, in .gtf format
+#     'genome_URL': URL for reference genome, in FASTA format
+# 3) a directory, 'scripts', in the same directory as this Snakefile, 
+#   containing the following scripts:
+#     'get-sras.py'
+#     'SJ_filter.py'
+#
+# Outputs:
+# 1) BAM files sorted by coordinate, labeled by their Gene Expression Omnibus 
+#   accession number from the NCBI GEO database.
+#
+
+import os
+import csv
+import pandas
+
+configfile: "config.yaml"
+
+INFILE = "all_samples.csv"
+
+df = pandas.read_csv(INFILE)
+
+gsm_map = {}
+for gsm, sras in df.groupby('GSM'):
+	gsm_map[gsm] = sras['SRA'].tolist()
+	
+gsm_bams = expand("second_aligned/{gsm}Aligned.sortedByCoord.out.bam", 
+	gsm = gsm_map.keys())
+
+def get_sras_for_gsm(wildcards):
+	return expand("temp_fastqs/{sra}_{end}.fastq.gz", 
+	sra=gsm_map[wildcards.gsm], end=wildcards.end)
+
+
+rule all:
+	input: gsm_bams
+
+rule get_sra_files: 
+	output:
+		"sras/{sra}.sra"
+	shell:
+		"python scripts/get-sras.py {wildcards.sra} {config[ncbi_prefix]}"
+
+rule sra_to_fastq:
+	input: 
+		"sras/{sra}.sra"
+	output:
+		fq1="temp_fastqs/{sra}_1.fastq.gz",
+		fq2="temp_fastqs/{sra}_2.fastq.gz"
+	threads: 16
+	shell:
+		"fastq-dump -I -O temp_fastqs/ --gzip --split-files 
+		--disable-multithreading {input}"	
+
+rule concat_sra_for_gsm:
+	input:
+		get_sras_for_gsm
+	output:
+		"fastqs/{gsm}_{end}.fastq.gz"
+	shell:
+		"cat {input} > {output}"
+
+rule dl_gencode:
+	output:
+		"refs/gencode.v30.annotation.gtf"
+	shell:
+		"wget {config[annotation_URL]} -O refs/gencode.v30.annotation.gtf.gz; 
+		gunzip refs/gencode.v30.annotation.gtf.gz"
+
+rule dl_genome:
+	output:
+		"refs/GRCh38.p12.genome.fa"
+	shell:
+		"wget {config[genome_URL]} -O refs/GRCh38.p12.genome.fa.gz; 
+		gunzip refs/GRCh38.p12.genome.fa.gz"
+
+rule generate_star_index:
+	input:
+		fa="refs/GRCh38.p12.genome.fa",
+		gtf="refs/gencode.v30.annotation.gtf"
+	output:
+		directory("gd/")
+	threads: 16
+	shell:
+		"STAR --runMode genomeGenerate --genomeFastaFiles 
+		refs/GRCh38.p12.genome.fa --sjdbGTFfile 
+		refs/gencode.v30.annotation.gtf --genomeDir gd/ --sjdbOverhang 100 
+		--runThreadN {threads}"
+
+rule align_first:
+	input:
+		fastq1 = "fastqs/{gsm}_1.fastq.gz",
+		fastq2 = "fastqs/{gsm}_2.fastq.gz",
+		idx_dir = "gd/"
+	output:
+		"first_pass/{gsm}SJ.out.tab"
+	threads: 16
+	shell:
+		"STAR --runMode alignReads --outSAMtype BAM SortedByCoordinate 
+		--genomeDir gd/ --readFilesIn {input.fastq1} {input.fastq2} 
+		--sjdbGTFfile refs/gencode.v30.annotation.gtf --outFileNamePrefix 
+		first_pass/{wildcards.gsm} --readFilesCommand zcat --runThreadN 
+		{threads}"
+
+rule filter_splice_junctions:
+	input: 
+		"first_pass/{gsm}SJ.out.tab"
+	output:
+		outfile="SJ/{gsm}_tSJ.out.tab"
+	shell:
+		"python scripts/SJ_filter.py {wildcards.gsm}"
+	
+rule second_index:
+	input:
+		expand("SJ/{gsm}_tSJ.out.tab", gsm = gsm_map.keys()),
+		fa="refs/GRCh38.p12.genome.fa",
+		gtf="refs/gencode.v30.annotation.gtf"
+	output:
+		touch("index.done")
+	threads: 16
+	run:
+		shell("mkdir -p gd2")
+		shell("STAR --runMode genomeGenerate --genomeDir gd2/ 
+		--genomeFastaFiles refs/GRCh38.p12.genome.fa --sjdbGTFfile 
+		refs/gencode.v30.annotation.gtf --runThreadN {threads} 
+		--sjdbOverhang 100 --sjdbFileChrStartEnd SJ/*SJ.out.tab")
+
+rule align_second:
+	input:
+		fastq1 = "fastqs/{gsm}_1.fastq.gz",
+		fastq2 = "fastqs/{gsm}_2.fastq.gz",
+		flag = "index.done"
+	output:
+		"second_aligned/{gsm}Aligned.sortedByCoord.out.bam"
+	threads: 16
+	shell:
+		"STAR --runMode alignReads --outSAMtype BAM SortedByCoordinate 
+		--genomeDir gd2/ --readFilesIn fastqs/{wildcards.gsm}_1.fastq.gz 
+		fastqs/{wildcards.gsm}_2.fastq.gz --outFileNamePrefix 
+		second_aligned/{wildcards.gsm} --readFilesCommand zcat 
+		--runThreadN {threads} --outWigType wiggle read1_5p"
+
